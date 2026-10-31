@@ -1,6 +1,8 @@
 import 'dotenv/config'
-import { readFile } from 'node:fs/promises'
+import { mkdir, readFile } from 'node:fs/promises'
+import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { PGlite } from '@electric-sql/pglite'
 import bcrypt from 'bcryptjs'
 import cors from 'cors'
 import express from 'express'
@@ -10,19 +12,43 @@ import jwt from 'jsonwebtoken'
 import pg from 'pg'
 import { z } from 'zod'
 
-const { Pool } = pg
 const app = express()
 const port = Number(process.env.PORT ?? 4000)
 const databaseUrl = process.env.DATABASE_URL
-const jwtSecret = process.env.JWT_SECRET
+const isProduction = process.env.NODE_ENV === 'production'
+const jwtSecret = process.env.JWT_SECRET ?? (isProduction ? '' : 'pesatrack-local-development-secret-change-before-deploy')
 
-if (!databaseUrl) throw new Error('DATABASE_URL is required. Set it in your .env file.')
 if (!jwtSecret || jwtSecret.length < 32) throw new Error('JWT_SECRET is required and must be at least 32 characters.')
+if (isProduction && !databaseUrl) throw new Error('DATABASE_URL is required in production.')
 
-const pool = new Pool({
-  connectionString: databaseUrl,
-  ...(process.env.DATABASE_SSL === 'true' ? { ssl: { rejectUnauthorized: true } } : {}),
-})
+const dataDirectory = process.env.PESATRACK_DATA_DIR
+  ? resolve(process.env.PESATRACK_DATA_DIR)
+  : fileURLToPath(new URL('../data/pesatrack', import.meta.url))
+if (!databaseUrl) await mkdir(dataDirectory, { recursive: true })
+const database = databaseUrl
+  ? new pg.Pool({
+      connectionString: databaseUrl,
+      ...(process.env.DATABASE_SSL === 'true' ? { ssl: { rejectUnauthorized: true } } : {}),
+    })
+  : new PGlite(dataDirectory)
+
+const query = (...args) => database.query(...args)
+
+async function withTransaction(callback) {
+  if (!databaseUrl) return database.transaction(callback)
+  const client = await database.connect()
+  try {
+    await client.query('BEGIN')
+    const result = await callback(client)
+    await client.query('COMMIT')
+    return result
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally {
+    client.release()
+  }
+}
 
 app.disable('x-powered-by')
 app.use(helmet())
@@ -96,25 +122,20 @@ app.post('/api/auth/register', authLimiter, async (req, res, next) => {
   try {
     const { name, email, password } = validate(registerSchema, req.body)
     const passwordHash = await bcrypt.hash(password, 12)
-    const client = await pool.connect()
-    let user
     try {
-      await client.query('BEGIN')
-      const result = await client.query(
-        'INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id, name, email',
-        [name, email, passwordHash],
-      )
-      user = result.rows[0]
-      await client.query('INSERT INTO budgets (user_id) VALUES ($1)', [user.id])
-      await client.query('COMMIT')
+      const user = await withTransaction(async (client) => {
+        const result = await client.query(
+          'INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id, name, email',
+          [name, email, passwordHash],
+        )
+        await client.query('INSERT INTO budgets (user_id) VALUES ($1)', [result.rows[0].id])
+        return result.rows[0]
+      })
+      return res.status(201).json({ token: issueToken(user), user })
     } catch (error) {
-      await client.query('ROLLBACK')
       if (error.code === '23505') return res.status(409).json({ error: 'An account with this email already exists.' })
       throw error
-    } finally {
-      client.release()
     }
-    return res.status(201).json({ token: issueToken(user), user })
   } catch (error) {
     return next(error)
   }
@@ -123,7 +144,7 @@ app.post('/api/auth/register', authLimiter, async (req, res, next) => {
 app.post('/api/auth/login', authLimiter, async (req, res, next) => {
   try {
     const { email, password } = validate(loginSchema, req.body)
-    const result = await pool.query('SELECT id, name, email, password_hash FROM users WHERE email = $1', [email])
+    const result = await query('SELECT id, name, email, password_hash FROM users WHERE email = $1', [email])
     const user = result.rows[0]
     if (!user || !(await bcrypt.compare(password, user.password_hash))) {
       return res.status(401).json({ error: 'Email or password is incorrect.' })
@@ -140,13 +161,13 @@ app.post('/api/auth/login', authLimiter, async (req, res, next) => {
 app.get('/api/dashboard', requireAuth, async (req, res, next) => {
   try {
     const [userResult, transactionsResult, budgetResult] = await Promise.all([
-      pool.query('SELECT id, name, email FROM users WHERE id = $1', [req.userId]),
-      pool.query(
+      query('SELECT id, name, email FROM users WHERE id = $1', [req.userId]),
+      query(
         `SELECT id, description, amount, type, category, transaction_date::text AS date
          FROM transactions WHERE user_id = $1 ORDER BY transaction_date DESC, created_at DESC`,
         [req.userId],
       ),
-      pool.query('SELECT monthly_limit, currency FROM budgets WHERE user_id = $1', [req.userId]),
+      query('SELECT monthly_limit, currency FROM budgets WHERE user_id = $1', [req.userId]),
     ])
     if (!userResult.rows[0]) return res.status(401).json({ error: 'Your account is no longer available.' })
     const budget = budgetResult.rows[0]
@@ -167,7 +188,7 @@ app.get('/api/dashboard', requireAuth, async (req, res, next) => {
 app.post('/api/transactions', requireAuth, async (req, res, next) => {
   try {
     const item = validate(transactionSchema, req.body)
-    const result = await pool.query(
+    const result = await query(
       `INSERT INTO transactions (user_id, description, amount, type, category, transaction_date)
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING id, description, amount, type, category, transaction_date::text AS date`,
@@ -186,7 +207,7 @@ app.delete('/api/transactions/:id', requireAuth, async (req, res, next) => {
   try {
     const id = z.string().uuid().safeParse(req.params.id)
     if (!id.success) return res.status(400).json({ error: 'Invalid transaction ID.' })
-    const result = await pool.query('DELETE FROM transactions WHERE id = $1 AND user_id = $2', [id.data, req.userId])
+    const result = await query('DELETE FROM transactions WHERE id = $1 AND user_id = $2', [id.data, req.userId])
     if (result.rowCount === 0) return res.status(404).json({ error: 'Transaction not found.' })
     return res.status(204).end()
   } catch (error) {
@@ -197,7 +218,7 @@ app.delete('/api/transactions/:id', requireAuth, async (req, res, next) => {
 app.put('/api/budget', requireAuth, async (req, res, next) => {
   try {
     const { monthlyLimit, currency } = validate(budgetSchema, req.body)
-    const result = await pool.query(
+    const result = await query(
       `INSERT INTO budgets (user_id, monthly_limit, currency) VALUES ($1, $2, $3)
        ON CONFLICT (user_id) DO UPDATE SET monthly_limit = EXCLUDED.monthly_limit,
        currency = EXCLUDED.currency, updated_at = NOW()
@@ -222,20 +243,24 @@ app.use((error, _req, res, _next) => {
 const schemaPath = fileURLToPath(new URL('./schema.sql', import.meta.url))
 try {
   const schema = await readFile(schemaPath, 'utf8')
-  await pool.query(schema)
+  if (databaseUrl) await database.query(schema)
+  else await database.exec(schema)
 } catch (error) {
-  console.error('Could not initialize PostgreSQL schema. Check DATABASE_URL and database permissions.', error)
+  console.error('Could not initialize the database. Check DATABASE_URL and database permissions.', error)
   process.exitCode = 1
-  await pool.end()
+  if (databaseUrl) await database.end()
+  else await database.close()
   process.exit()
 }
 
-const server = app.listen(port, () => console.log(`PesaTrack API listening on http://localhost:${port}`))
+const onListening = () => console.log(`PesaTrack API listening on http://localhost:${port}`)
+const server = isProduction ? app.listen(port, onListening) : app.listen(port, '127.0.0.1', onListening)
 
 async function shutdown(signal) {
   console.log(`${signal} received; closing PesaTrack API.`)
   server.close(async (error) => {
-    await pool.end()
+    if (databaseUrl) await database.end()
+    else await database.close()
     if (error) {
       console.error('Error closing API server:', error)
       process.exitCode = 1

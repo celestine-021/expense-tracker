@@ -64,7 +64,7 @@ type DashboardData = {
 }
 
 const EMPTY_TRANSACTIONS: Transaction[] = []
-const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:4000/api'
+const API_URL = import.meta.env.VITE_API_URL ?? '/api'
 const categories = ['Food & Drink', 'Transport', 'Shopping', 'Bills', 'Entertainment', 'Health', 'Salary', 'Other']
 const categoryColors: Record<string, string> = {
   'Food & Drink': '#9b8af7',
@@ -106,7 +106,7 @@ async function request<T>(path: string, token: string | null, options: RequestIn
       },
     })
   } catch {
-    throw new Error(`Can’t reach the PesaTrack API at ${API_URL}. Start PostgreSQL, configure the project .env file, then run npm run dev:all. See README.md for setup steps.`)
+    throw new Error(`Can’t reach the PesaTrack API at ${API_URL}. Start the app with npm run dev and check the API terminal for startup errors.`)
   }
   const payload = await response.json().catch(() => ({}))
   if (!response.ok) throw new ApiError(payload.error ?? 'Something went wrong. Please try again.', response.status)
